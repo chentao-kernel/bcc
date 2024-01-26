@@ -66,6 +66,7 @@ APPS = \
 	mountsnoop \
 	numamove \
 	offcputime \
+	offcpu \
 	oomkill \
 	readahead \
 	runqlat \
