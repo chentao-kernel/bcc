@@ -14,8 +14,8 @@
 #include <bpf/libbpf.h>
 #include <sys/resource.h>
 #include <bpf/bpf.h>
-#include "futexctn.h"
-#include "futexctn.skel.h"
+#include "futexsnoop.h"
+#include "futexsnoop.skel.h"
 #include "trace_helpers.h"
 #ifdef USE_BLAZESYM
 #include "blazesym.h"
@@ -37,33 +37,39 @@ static struct env {
 	int perf_max_stack_depth;
 	bool summary;
 	bool timestamp;
-	bool milliseconds;
+	int milliseconds;
 	bool verbose;
+	int perf_buf_sz;
+	long min_dur_ms;
+	long max_dur_ms;
+	long max_lock_hold_users;
 } env = {
 	.interval = 99999999,
 	.times = 99999999,
 	.stack_storage_size = 1024,
 	.perf_max_stack_depth = 127,
+	.perf_buf_sz = 64,
+	.min_dur_ms = 10000,
+	.max_dur_ms = 100000,
+	.max_lock_hold_users = 5,
 };
 
 static volatile sig_atomic_t exiting = 0;
 
-const char *argp_program_version = "futexctn 0.1";
-const char *argp_program_bug_address =
-	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
+const char *argp_program_version = "futexsnoop 0.1";
 const char argp_program_doc[] =
 "Summarize futex contention latency as a histogram.\n"
 "\n"
-"USAGE: futexctn [--help] [-T] [-m] [-s] [-p pid] [-t tid] [-l lock] [interval] [count]\n"
+"USAGE: futexsnoop [--help] [-T] [-m] [-s] [-p pid] [-t tid] [-l lock] [interval] [count]\n"
 "\n"
 "EXAMPLES:\n"
-"    futexctn              # summarize futex contention latency as a histogram\n"
-"    futexctn 1 10         # print 1 second summaries, 10 times\n"
-"    futexctn -mT 1        # 1s summaries, milliseconds, and timestamps\n"
-"    futexctn -s 1         # 1s summaries, without stack traces\n"
-"    futexctn -l 0x8187bb8 # only trace lock 0x8187bb8\n"
-"    futexctn -p 123       # only trace threads for PID 123\n"
-"    futexctn -t 125       # only trace thread 125\n";
+"    futexsnoop              # summarize futex contention latency as a histogram\n"
+"    futexsnoop 1 10         # print 1 second summaries, 10 times\n"
+"    futexsnoop -mT 1        # 1s summaries, milliseconds, and timestamps\n"
+"    futexsnoop -s 1         # 1s summaries, without stack traces\n"
+"    futexsnoop -l 0x8187bb8 # only trace lock 0x8187bb8\n"
+"    futexsnoop -p 123       # only trace threads for PID 123\n"
+"    futexsnoop -t 125       # only trace thread 125\n";
 
 #define OPT_PERF_MAX_STACK_DEPTH	1 /* --pef-max-stack-depth */
 #define OPT_STACK_STORAGE_SIZE		2 /* --stack-storage-size */
@@ -73,7 +79,9 @@ static const struct argp_option opts[] = {
 	{ "tid", 't', "TID", 0, "Trace this TID only" },
 	{ "lock", 'l', "LOCK", 0, "Trace this lock only" },
 	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "milliseconds", 'm', NULL, 0, "Millisecond histogram" },
+	{ "mindur", 'm', "MINDUR", 0, "min dur ms" },
+	{ "lockuser", 'n', "LOCKUSER", 0, "lock user cnt" },
+	{ "maxdur", 'M', "MAXDUR", 0, "max dur ms" },
 	{ "perf-max-stack-depth", OPT_PERF_MAX_STACK_DEPTH,
 	  "PERF-MAX-STACK-DEPTH", 0, "the limit for the stack traces (default 127)" },
 	{ "stack-storage-size", OPT_STACK_STORAGE_SIZE, "STACK-STORAGE-SIZE", 0,
@@ -96,7 +104,13 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env.verbose = true;
 		break;
 	case 'm':
-		env.milliseconds = true;
+		env.min_dur_ms = strtol(arg, NULL, 10);
+		break;
+	case 'M':
+		env.max_dur_ms = strtol(arg, NULL, 10);
+		break;
+	case 'n':
+		env.max_lock_hold_users = strtol(arg, NULL, 10);
 		break;
 	case 's':
 		env.summary = true;
@@ -183,7 +197,7 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static int print_stack(struct futexctn_bpf *obj, struct hist_key *info)
+static int print_stack(struct futexsnoop_bpf *obj, struct hist_key *info)
 {
 #ifdef USE_BLAZESYM
 	sym_src_cfg cfgs[] = {
@@ -268,10 +282,10 @@ cleanup:
 	return 0;
 }
 
-static int print_map(struct futexctn_bpf *obj)
+static int print_map(struct futexsnoop_bpf *obj)
 {
 	struct hist_key lookup_key = { .pid_tgid = -1 }, next_key;
-	const char *units = env.milliseconds ? "msecs" : "usecs";
+	const char *units = "msecs";
 	int err,fd = bpf_map__fd(obj->maps.hists);
 	struct hist hist;
 
@@ -310,6 +324,34 @@ static int print_map(struct futexctn_bpf *obj)
 	return 0;
 }
 
+static void handle_event(void *ctx, int cpu, void *data, __u64 size)
+{
+	time_t t;
+	char ts[32];
+	struct tm *tm;
+
+	time(&t);
+	tm = localtime(&t);
+	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	printf("%-8s\n", ts);
+
+	if (size >= sizeof(struct lock_stat) && size < sizeof(struct hist)) {
+		struct lock_stat *e = (struct lock_stat *)data;
+		printf("lock_stat, uaddr:0x%llx, user_cnt:%d, max_user_cnt:%d, comm:%s, tid:%u\n",
+				e->uaddr, e->user_cnt, e->max_user_cnt, e->comm, e->pid_tgid);
+	}
+	if (size >= sizeof(struct hist)) {
+		struct hist *e = (struct hist*)data;
+		printf("hist, uaddr:0x%llx, pid:%u, comm:%s, avg:%lluus, total_cnt:%llu, min:%lluus, max:%lluus\n",
+				e->uaddr, e->pid_tgid, e->comm, e->total_elapsed/e->contended, e->contended, e->min, e->max);
+	}
+}
+
+static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
+{
+	fprintf(stderr, "Lost %llu events on CPU #%d\n", lost_cnt, cpu);
+}
+
 int main(int argc, char **argv)
 {
 	static const struct argp argp = {
@@ -317,11 +359,14 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct futexctn_bpf *obj;
+	struct futexsnoop_bpf *obj;
 	struct tm *tm;
 	char ts[32];
 	time_t t;
 	int err;
+	struct user_args args = {0};
+	__u32 zero = 0;
+	struct perf_buffer *pb = NULL;	
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
@@ -329,29 +374,46 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	obj = futexctn_bpf__open();
+	obj = futexsnoop_bpf__open();
 	if (!obj) {
 		fprintf(stderr, "failed to open BPF object\n");
 		return 1;
 	}
 
 	/* initialize global data (filtering options) */
-	obj->rodata->targ_pid = env.pid;
-	obj->rodata->targ_tid = env.tid;
-	obj->rodata->targ_lock = env.lock;
-	obj->rodata->targ_ms = env.milliseconds;
-	obj->rodata->targ_summary = env.summary;
+	args.targ_pid = env.pid;
+	args.targ_tid = env.tid;
+	args.targ_lock = env.lock;
+	args.targ_summary = env.summary;
+	args.min_dur_ms = env.min_dur_ms;
+	args.max_dur_ms = env.max_dur_ms;
+	args.max_lock_hold_users = env.max_lock_hold_users;
 
 	bpf_map__set_value_size(obj->maps.stackmap,
 				env.perf_max_stack_depth * sizeof(unsigned long));
 	bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
 
-	err = futexctn_bpf__load(obj);
+	err = futexsnoop_bpf__load(obj);
 	if (err) {
 		fprintf(stderr, "failed to load BPF programs\n");
 		goto cleanup;
 	}
-	err = futexctn_bpf__attach(obj);
+	err = bpf_map__update_elem(obj->maps.args_map, &zero, sizeof(zero), &args,
+							   sizeof(struct user_args), BPF_ANY);
+	if (err) {
+		fprintf(stderr, "failed to update maps\n");
+		goto cleanup;
+	}
+
+	pb = perf_buffer__new(bpf_map__fd(obj->maps.perf_map), env.perf_buf_sz,
+							handle_event, handle_lost_events, NULL, NULL);
+	if (!pb) {
+		err = -errno;
+		fprintf(stderr, "open perf buffer failed:%s\n", strerror(err));
+		goto cleanup;
+	}
+
+	err = futexsnoop_bpf__attach(obj);
 	if (err) {
 		fprintf(stderr, "failed to attach BPF programs\n");
 		goto cleanup;
@@ -369,26 +431,28 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sig_handler);
 
-	/* main: poll */
-	while (1) {
-		sleep(env.interval);
-		printf("\n");
-
-		if (env.timestamp) {
-			time(&t);
-			tm = localtime(&t);
-			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-			printf("%-8s\n", ts);
+	for (;;) {
+		err = perf_buffer__poll(pb, 100);
+		if (err < 0 && err != -EINTR) {
+			fprintf(stderr, "error polling perf buffer:%s\n",strerror(err));
+			goto cleanup;
 		}
 
-		print_map(obj);
+		if (exiting || --env.times == 0) {
+			if (env.timestamp) {
+				time(&t);
+				tm = localtime(&t);
+				strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+				printf("%-8s\n", ts);
+			}
 
-		if (exiting || --env.times == 0)
+			print_map(obj);
 			break;
+		}
 	}
 
 cleanup:
-	futexctn_bpf__destroy(obj);
+	futexsnoop_bpf__destroy(obj);
 #ifdef USE_BLAZESYM
 	blazesym_free(symbolizer);
 #else

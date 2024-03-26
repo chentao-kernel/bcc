@@ -33,7 +33,7 @@ struct {
 	__uint(max_entries, 8);
 	__type(key, u32);
 	__type(value, struct user_args);
-} user_args SEC(".maps");
+} args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
@@ -54,6 +54,12 @@ struct {
 	__type(value, struct hist);
 } hists SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+} perf_map SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_futex")
 int futex_enter(struct syscall_trace_enter *ctx)
 {
@@ -65,10 +71,10 @@ int futex_enter(struct syscall_trace_enter *ctx)
 	struct lock_stat lock_init = {
 		.user_cnt = 1,
 		.max_user_cnt = 1,
+		.uaddr = 0,
 	};
-
-	u32 tid;
-	u32 pid;
+	u32 tid, pid;
+	struct lock_stat event = {0};
 
 	if (((int)ctx->args[1] & FUTEX_CMD_MASK) != FUTEX_WAIT)
 		return 0;
@@ -76,12 +82,13 @@ int futex_enter(struct syscall_trace_enter *ctx)
 	v.uaddr = ctx->args[0];
 	v.ts = bpf_ktime_get_ns();
 
+	args = bpf_map_lookup_elem(&args_map, &zero);
+	if (!args)
+		return 0;
+
 	pid_tgid = bpf_get_current_pid_tgid();
 	tid = (__u32)pid_tgid;
 	pid = pid_tgid >> 32;
-	args = bpf_map_lookup_elem(&user_args, &zero);
-	if (!args)
-		return 0;
 
 	if (args->targ_pid && args->targ_pid != pid)
 		return 0;
@@ -95,17 +102,30 @@ int futex_enter(struct syscall_trace_enter *ctx)
 	lock = bpf_map_lookup_elem(&lockmap, &v.uaddr);
 	if (lock) {
 		__sync_fetch_and_add(&lock->user_cnt, 1);
-		if (lock->user_cnt > lock->max_user_cnt)
+		if (lock->user_cnt > lock->max_user_cnt) {
 			lock->max_user_cnt = lock->user_cnt;
-	} else
+		}
+
+		if (lock->max_user_cnt > args->max_lock_hold_users) {
+			event = *lock;
+			event.pid_tgid = pid_tgid;
+			event.ts = v.ts;
+			bpf_get_current_comm(event.comm, sizeof(event.comm));
+			bpf_perf_event_output(ctx, &perf_map, BPF_F_CURRENT_CPU, 
+								&event, sizeof(event));
+		}
+	} else {
+		lock_init.uaddr = v.uaddr;
 		bpf_map_update_elem(&lockmap, &v.uaddr, &lock_init, BPF_ANY);
+	}
+	
 	return 0;
 }
 
 SEC("tracepoint/syscalls/sys_exit_futex")
 int futex_exit(struct syscall_trace_exit *ctx)
 {
-	u64 pid_tgid, slot, ts, min, max;
+	u64 pid_tgid, slot, ts, min, max, avg;
 	struct hist_key hkey = {};
 	struct hist *histp;
 	struct val_t *vp;
@@ -114,6 +134,7 @@ int futex_exit(struct syscall_trace_exit *ctx)
 	struct user_args *args = NULL;
 	u32 zero = 0;
 	s64 delta;
+	struct hist event = {0};
 
 	ts = bpf_ktime_get_ns();
 	pid_tgid = bpf_get_current_pid_tgid();
@@ -134,7 +155,7 @@ int futex_exit(struct syscall_trace_exit *ctx)
 
 	hkey.pid_tgid = pid_tgid;
 	hkey.uaddr = vp->uaddr;
-	args = bpf_map_lookup_elem(&user_args, &zero);
+	args = bpf_map_lookup_elem(&args_map, &zero);
 	if (!args)
 		return 0;
 
@@ -163,7 +184,16 @@ int futex_exit(struct syscall_trace_exit *ctx)
 		__sync_val_compare_and_swap(&histp->max, max, delta);
 		histp->max_ts = ts;
 	}
+	avg = histp->total_elapsed / histp->contended;
 	bpf_get_current_comm(&histp->comm, sizeof(histp->comm));
+	if (delta > args->min_dur_ms && delta < args->max_dur_ms && delta < avg) {
+		histp->uaddr = hkey.uaddr;
+		histp->pid_tgid = hkey.pid_tgid;
+		histp->user_stack_id = hkey.user_stack_id;
+		event = *histp;
+		bpf_perf_event_output(ctx, &perf_map, BPF_F_CURRENT_CPU, 
+							  &event, sizeof(event));
+	}
 
 cleanup:
 	bpf_map_delete_elem(&start, &pid_tgid);
