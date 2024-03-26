@@ -14,8 +14,8 @@
 #include <bpf/libbpf.h>
 #include <sys/resource.h>
 #include <bpf/bpf.h>
-#include "futexctn.h"
-#include "futexctn.skel.h"
+#include "futexsnoop.h"
+#include "futexsnoop.skel.h"
 #include "trace_helpers.h"
 #ifdef USE_BLAZESYM
 #include "blazesym.h"
@@ -48,22 +48,20 @@ static struct env {
 
 static volatile sig_atomic_t exiting = 0;
 
-const char *argp_program_version = "futexctn 0.1";
-const char *argp_program_bug_address =
-	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
+const char *argp_program_version = "futexsnoop 0.1";
 const char argp_program_doc[] =
 "Summarize futex contention latency as a histogram.\n"
 "\n"
-"USAGE: futexctn [--help] [-T] [-m] [-s] [-p pid] [-t tid] [-l lock] [interval] [count]\n"
+"USAGE: futexsnoop [--help] [-T] [-m] [-s] [-p pid] [-t tid] [-l lock] [interval] [count]\n"
 "\n"
 "EXAMPLES:\n"
-"    futexctn              # summarize futex contention latency as a histogram\n"
-"    futexctn 1 10         # print 1 second summaries, 10 times\n"
-"    futexctn -mT 1        # 1s summaries, milliseconds, and timestamps\n"
-"    futexctn -s 1         # 1s summaries, without stack traces\n"
-"    futexctn -l 0x8187bb8 # only trace lock 0x8187bb8\n"
-"    futexctn -p 123       # only trace threads for PID 123\n"
-"    futexctn -t 125       # only trace thread 125\n";
+"    futexsnoop              # summarize futex contention latency as a histogram\n"
+"    futexsnoop 1 10         # print 1 second summaries, 10 times\n"
+"    futexsnoop -mT 1        # 1s summaries, milliseconds, and timestamps\n"
+"    futexsnoop -s 1         # 1s summaries, without stack traces\n"
+"    futexsnoop -l 0x8187bb8 # only trace lock 0x8187bb8\n"
+"    futexsnoop -p 123       # only trace threads for PID 123\n"
+"    futexsnoop -t 125       # only trace thread 125\n";
 
 #define OPT_PERF_MAX_STACK_DEPTH	1 /* --pef-max-stack-depth */
 #define OPT_STACK_STORAGE_SIZE		2 /* --stack-storage-size */
@@ -183,7 +181,7 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static int print_stack(struct futexctn_bpf *obj, struct hist_key *info)
+static int print_stack(struct futexsnoop_bpf *obj, struct hist_key *info)
 {
 #ifdef USE_BLAZESYM
 	sym_src_cfg cfgs[] = {
@@ -268,7 +266,7 @@ cleanup:
 	return 0;
 }
 
-static int print_map(struct futexctn_bpf *obj)
+static int print_map(struct futexsnoop_bpf *obj)
 {
 	struct hist_key lookup_key = { .pid_tgid = -1 }, next_key;
 	const char *units = env.milliseconds ? "msecs" : "usecs";
@@ -317,11 +315,13 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct futexctn_bpf *obj;
+	struct futexsnoop_bpf *obj;
 	struct tm *tm;
 	char ts[32];
 	time_t t;
 	int err;
+	struct user_args args = {0};
+	__u32 zero = 0;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
@@ -329,29 +329,35 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	obj = futexctn_bpf__open();
+	obj = futexsnoop_bpf__open();
 	if (!obj) {
 		fprintf(stderr, "failed to open BPF object\n");
 		return 1;
 	}
 
 	/* initialize global data (filtering options) */
-	obj->rodata->targ_pid = env.pid;
-	obj->rodata->targ_tid = env.tid;
-	obj->rodata->targ_lock = env.lock;
-	obj->rodata->targ_ms = env.milliseconds;
-	obj->rodata->targ_summary = env.summary;
+	args.targ_pid = env.pid;
+	args.targ_tid = env.tid;
+	args.targ_lock = env.lock;
+	args.targ_summary = env.summary;
 
 	bpf_map__set_value_size(obj->maps.stackmap,
 				env.perf_max_stack_depth * sizeof(unsigned long));
 	bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
 
-	err = futexctn_bpf__load(obj);
+	err = futexsnoop_bpf__load(obj);
 	if (err) {
 		fprintf(stderr, "failed to load BPF programs\n");
 		goto cleanup;
 	}
-	err = futexctn_bpf__attach(obj);
+	err = bpf_map__update_elem(obj->maps.user_args, &zero, sizeof(zero), &args,
+							   sizeof(struct user_args), BPF_ANY);
+	if (err) {
+		fprintf(stderr, "failed to update maps\n");
+		goto cleanup;
+	}
+
+	err = futexsnoop_bpf__attach(obj);
 	if (err) {
 		fprintf(stderr, "failed to attach BPF programs\n");
 		goto cleanup;
@@ -388,7 +394,7 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
-	futexctn_bpf__destroy(obj);
+	futexsnoop_bpf__destroy(obj);
 #ifdef USE_BLAZESYM
 	blazesym_free(symbolizer);
 #else

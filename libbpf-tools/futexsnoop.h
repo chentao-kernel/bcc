@@ -11,6 +11,13 @@ struct hist_key {
 	int user_stack_id;
 };
 
+struct user_args {
+	__u32 targ_pid;
+	__u32 targ_tid;
+	__u64 targ_lock;
+	bool targ_summary;
+};
+
 struct hist {
 	__u32 slots[MAX_SLOTS];
 	char comm[TASK_COMM_LEN];
@@ -18,6 +25,11 @@ struct hist {
 	__u64 total_elapsed;
 	__u64 min;
 	__u64 max;
+};
+
+struct lock_stat {
+	uint32_t user_cnt;
+	uint32_t max_user_cnt;
 };
 
 #endif /* FUTEXCTN_H_ */
