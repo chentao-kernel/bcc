@@ -94,6 +94,7 @@ APPS = \
 	tcptop \
 	vfsstat \
 	wakeuptime \
+	remap_trace \
 	$(BZ_APPS) \
 	#
 
