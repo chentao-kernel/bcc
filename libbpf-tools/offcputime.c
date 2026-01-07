@@ -194,6 +194,57 @@ static void sig_handler(int sig)
 {
 }
 
+static void print_map_bcc(struct offcputime_bpf *obj)
+{
+	struct key_t lookup_key = {}, next_key;
+	int err, i, ifd, sfd;
+	int idx;
+	struct val_t val;
+	char buf[4096];
+
+	ifd = bpf_map__fd(obj->maps.info);
+	sfd = bpf_map__fd(obj->maps.stackmap);
+	while (!bpf_map_get_next_key(ifd, &lookup_key, &next_key)) {
+		idx = 0;
+
+		err = bpf_map_lookup_elem(ifd, &next_key, &val);
+		if (err < 0) {
+			fprintf(stderr, "failed to lookup info: %d\n", err);
+			goto free_buf;
+		}
+		lookup_key = next_key;
+		if (val.delta == 0)
+			continue;
+
+		memset(buf, 0, 4096);
+		err = symbol_resolve(sfd, &next_key.kern_stack_id, 0, buf, 4096);
+		if (err < 0) {
+			fprintf(stderr, "failed to resolve kernel stack: %d\n", err);
+			goto free_buf;
+		}
+		printf("kernel stack:\n");
+		printf("%s\n", buf);
+
+print_ustack:
+		if (next_key.user_stack_id == -1)
+			goto skip_ustack;
+
+		err = symbol_resolve(sfd, &next_key.user_stack_id, next_key.tgid, buf, 4096);
+		if (err < 0) {
+			fprintf(stderr, "failed to resolve user stack: %d\n", err);
+			goto free_buf;
+		}
+		printf("user stack:\n");
+		printf("%s\n", buf);
+skip_ustack:
+		printf("%-16s %s (%d)\n", "-", val.comm, next_key.pid);
+		printf("dur: %lld(us)\n\n", val.delta);
+	}
+
+free_buf:
+	free(buf);
+}
+
 static void print_map(struct ksyms *ksyms, struct syms_cache *syms_cache,
 		      struct offcputime_bpf *obj)
 {
@@ -418,6 +469,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to create syms_cache\n");
 		goto cleanup;
 	}
+
+	symbol_new(500);
+
 	err = offcputime_bpf__attach(obj);
 	if (err) {
 		fprintf(stderr, "failed to attach BPF programs\n");
@@ -434,11 +488,12 @@ int main(int argc, char **argv)
 	 */
 	sleep(env.duration);
 
-	print_map(ksyms, syms_cache, obj);
+	print_map_bcc(obj);
 
 cleanup:
 	offcputime_bpf__destroy(obj);
 	syms_cache__free(syms_cache);
 	ksyms__free(ksyms);
+	symbol_free();
 	return err != 0;
 }

@@ -22,6 +22,9 @@
 #include <limits.h>
 #include "trace_helpers.h"
 #include "uprobe_helpers.h"
+#include "build-syms/bcc_sym_api.h"
+
+#define PERF_MAX_STACK_DEPTH 127
 
 #define min(x, y) ({				\
 	typeof(x) _min1 = (x);			\
@@ -1354,4 +1357,32 @@ int str_timestamp(const char *format, char *buf, size_t buf_len)
 	if (!tm)
 		return -errno;
 	return strftime(buf, buf_len, format, tm);
+}
+
+void symbol_new(int sym_cache_size)
+{
+	bcc_stack_table_new(sym_cache_size);
+}
+
+void symbol_free(void)
+{
+	bcc_stack_table_free();
+}
+
+int symbol_resolve(int fd, const void *stack_id, unsigned int tgid, char *buf,
+		   size_t buf_sz)
+{
+	uint64_t ip[PERF_MAX_STACK_DEPTH];
+	int ret;
+	uint32_t pid;
+
+	memset(ip, 0, PERF_MAX_STACK_DEPTH);
+
+	pid = tgid == 0 ? -1 : tgid;
+
+	if (bpf_map_lookup_elem(fd, stack_id, ip) >= 0) {
+		// todo: remove the stackid in kernel
+		return bcc_stack_look_sym(ip, pid, buf, buf_sz);
+	}
+	return 0;
 }

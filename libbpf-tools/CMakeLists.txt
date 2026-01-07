@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 
 cmake_minimum_required(VERSION 3.16)
-project(libbpf-tools C)
+project(libbpf-tools C CXX)
 
 # Tell cmake where to find BpfObject module
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/tools/cmake)
+
+add_subdirectory(build-syms)
 
 # Build vendored libbpf
 include(ExternalProject)
@@ -95,9 +97,11 @@ foreach(app ${apps})
   # Build object skeleton and depend skeleton on libbpf build
   bpf_object(${app_stem} ${app_stem}.bpf.c)
   add_dependencies(${app_stem}_skel libbpf-build bpftool-build)
-
   add_executable(${app_stem} ${app_stem}.c ${COMMON_SOURCES})
-  target_link_libraries(${app_stem} ${app_stem}_skel)
+
+  add_dependencies(${app_stem} bcc-syms-static)
+  set_target_properties(${app_stem} PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(${app_stem} ${app_stem}_skel bcc-syms-static)
   if(${app_stem} STREQUAL profile)
     target_include_directories(${app_stem} PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/blazesym/capi/include)

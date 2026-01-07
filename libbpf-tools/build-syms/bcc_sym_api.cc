@@ -1,4 +1,4 @@
-#include "table.h"
+#include "BPFTable.h"
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include "linux/bpf.h"
 #include "bcc_sym_api.h"
+#include <iostream>
 
 /*
  * stack table api for c
@@ -25,7 +26,8 @@ void bcc_stack_table_new(int sym_cache_size)
     TableDesc tdesc("stack_map", FileDesc(-1), BPF_MAP_TYPE_STACK_TRACE,
                         sizeof(uint32_t), sizeof(uint32_t), 1, 0);
 
-    stack_table_g = new BPFStackTable(tdesc, true, true, sym_cache_size);
+    stack_table_g = new BPFStackTable(tdesc, true, true);
+    stack_table_g->SetSymCacheSize(sym_cache_size);
 }
 
 void bcc_stack_table_free()
@@ -36,7 +38,7 @@ void bcc_stack_table_free()
     }
 }
 
-int bcc_stack_look_sym(int fd, uint64_t *ips, uint32_t pid, char *buf,
+int bcc_stack_look_sym(uint64_t *ips, uint32_t pid, char *buf,
                                 uint32_t buf_size)
 {
     std::vector<std::string> stacks;
@@ -46,8 +48,8 @@ int bcc_stack_look_sym(int fd, uint64_t *ips, uint32_t pid, char *buf,
 
     if (stack_table_g == nullptr)
         return 0;
-;
-    stacks = stack_table_g->get_stack_symbol(ips, pid);
+
+    stacks = stack_table_g->get_stack_symbols(ips, pid);
 
     for (auto stack : stacks) {
         ret = snprintf(buf + id, buf_size - id, sym_fmt, stack.c_str(), stack.size());

@@ -381,11 +381,17 @@ class BPFStackTable : public BPFTableBase<int, stacktrace_t> {
   void free_symcache(int pid);
   void clear_table_non_atomic();
   std::vector<uintptr_t> get_stack_addr(int stack_id);
+  std::vector<uintptr_t> get_stack_ips(uintptr_t *ips);
   std::vector<std::string> get_stack_symbol(int stack_id, int pid);
+  std::vector<std::string> get_stack_symbols(uintptr_t *stack_id, int pid);
+  void SetSymCacheSize(int sym_cache_size);
+  int GetSymCacheSize(void);
+  void cleanup_sym();
 
  private:
   bcc_symbol_option symbol_option_;
   std::map<int, void*> pid_sym_;
+  int sym_cache_size_;
 };
 
 // from src/cc/export/helpers.h

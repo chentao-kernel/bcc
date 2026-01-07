@@ -137,4 +137,18 @@ int str_loadavg(char *buf, size_t buf_len);
  */
 int str_timestamp(const char *format, char *buf, size_t buf_len);
 
+void symbol_new(int sym_cache_size);
+void symbol_free(void);
+
+/*
+ * @fd: stackmp fd
+ * @stack_id: stack id
+ * @tgid: task pid
+ * @buf: stack buffer
+ * @buf_sz: buffer size
+ */
+int symbol_resolve(int fd, const void *stack_id, unsigned int tgid, char *buf,
+		   size_t buf_sz);
+
+
 #endif /* __TRACE_HELPERS_H */

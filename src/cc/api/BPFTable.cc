@@ -260,6 +260,30 @@ BPFStackTable::BPFStackTable(const TableDesc& desc, bool use_debug_file,
                     .check_debug_file_crc = check_debug_file_crc,
                     .lazy_symbolize = 1,
                     .use_symbol_type = use_symbol_type};
+  sym_cache_size_ = 1000;
+}
+
+void BPFStackTable::SetSymCacheSize(int sym_cache_size) {
+	sym_cache_size_ = sym_cache_size;
+}
+
+int BPFStackTable::GetSymCacheSize(void) {
+	return sym_cache_size_;
+}
+
+void BPFStackTable::cleanup_sym() {
+	if (pid_sym_.size() > sym_cache_size_) {
+		for (auto it = pid_sym_.begin(); it != pid_sym_.end();) {
+			// kernel sym cache
+			if (it->first == -1) {
+				++it;
+				continue;
+			}
+
+			bcc_free_symcache(it->second, it->first);
+			it = pid_sym_.erase(it);
+		}
+	}
 }
 
 BPFStackTable::BPFStackTable(BPFStackTable&& that)
@@ -288,6 +312,13 @@ void BPFStackTable::clear_table_non_atomic() {
   }
 }
 
+std::vector<uintptr_t> BPFStackTable::get_stack_ips(uintptr_t *ips) {
+	std::vector<uintptr_t> res;
+	for (int i = 0; (i < BPF_MAX_STACK_DEPTH) && (ips[i] != 0); i++)
+		res.push_back(ips[i]);
+	return res;
+}
+
 std::vector<uintptr_t> BPFStackTable::get_stack_addr(int stack_id) {
   std::vector<uintptr_t> res;
   stacktrace_t stack;
@@ -297,6 +328,36 @@ std::vector<uintptr_t> BPFStackTable::get_stack_addr(int stack_id) {
     return res;
   for (int i = 0; (i < BPF_MAX_STACK_DEPTH) && (stack.ip[i] != 0); i++)
     res.push_back(stack.ip[i]);
+  return res;
+}
+
+std::vector<std::string> BPFStackTable::get_stack_symbols(uintptr_t *stack_id,
+                                                         int pid) {
+  auto addresses = get_stack_ips(stack_id);
+  std::vector<std::string> res;
+  if (addresses.empty())
+    return res;
+
+  res.reserve(addresses.size());
+
+  if (pid < 0)
+    pid = -1;
+
+  cleanup_sym();
+
+  if (pid_sym_.find(pid) == pid_sym_.end())
+    pid_sym_[pid] = bcc_symcache_new(pid, &symbol_option_);
+  void* cache = pid_sym_[pid];
+
+  bcc_symbol symbol;
+  for (auto addr : addresses)
+    if (bcc_symcache_resolve(cache, addr, &symbol) != 0)
+      res.emplace_back("[UNKNOWN]");
+    else {
+      res.push_back(symbol.demangle_name);
+      bcc_symbol_free_demangle_name(&symbol);
+    }
+
   return res;
 }
 
